@@ -126,7 +126,7 @@ def gated_delta_rule_2(
 
         # e_t = (b_t ⊙ k_t)ᵀ S  →  d_v-dimensional "old value" at that key
         # Equivalent to: for each value dim v, e[v] = sum_k bk_t[k] * S[k, v]
-        e_t = torch.einsum("bhk, bhkv -> bhv", bk_t, S)   # [B, H, d_v]
+        e_t = (bk_t.unsqueeze(-2) @ S).squeeze(-2)        # [B, H, d_v]
 
         # ── Step 3: Delta write — new gated value minus erased old value ──────
         # Compared with the plain delta rule (v̂ = v_t − e_t), GDN-2 applies
@@ -136,11 +136,11 @@ def gated_delta_rule_2(
         # ── Step 4: Rank-1 state update ──────────────────────────────────────
         # Add the outer product k_t ⊗ v̂_t to S.
         # k_t[b,h,k] * v_hat[b,h,v] → contributes to S[b,h,k,v]
-        S = S + torch.einsum("bhk, bhv -> bhkv", k_t, v_hat)
+        S = S + k_t.unsqueeze(-1) * v_hat.unsqueeze(-2)   # outer product → [B, H, d_k, d_v]
 
         # ── Step 5: Read output with query ────────────────────────────────────
         # o_t = Sᵀ q_t  →  for each value dim v: o[v] = sum_k S[k,v] * q_t[k]
-        o_t = torch.einsum("bhkv, bhk -> bhv", S, q_t)    # [B, H, d_v]
+        o_t = (q_t.unsqueeze(-2) @ S).squeeze(-2)          # [B, H, d_v]
 
         outputs.append(o_t)
 
