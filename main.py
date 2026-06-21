@@ -132,15 +132,23 @@ def eval_step(model: nnx.Module, batch: dict[str, jax.Array]) -> jax.Array:
 
 
 @nnx.jit
-def predict_next_token(model: nnx.Module, input_ids: jax.Array) -> jax.Array:
-    """Runs a single forward pass to predict the next word."""
+def predict_next_token(
+    model: nnx.Module, input_ids: jax.Array, last_idx: jax.Array
+) -> jax.Array:
+    """Runs a single forward pass to predict the next word.
+
+    `input_ids` may be right-padded so its length is a multiple of the model's
+    chunk_size; `last_idx` is the position of the last *real* token, from which
+    the next-token logits are read. The model is causal, so right-padding after
+    `last_idx` cannot influence the prediction at `last_idx`.
+    """
 
     # 1. Get the raw scores (logits) for every token in the vocabulary
     logits = model(input_ids)
 
-    # 2. Isolate the predictions for the very last token in our sequence
+    # 2. Isolate the predictions for the last real token in our sequence
     # Shape goes from (batch, seq_len, vocab_size) -> (vocab_size,)
-    next_token_logits = logits[0, -1, :]
+    next_token_logits = logits[0, last_idx, :]
 
     # 3. Greedy Decoding: Simply pick the token with the highest probability score
     next_token = jnp.argmax(next_token_logits)
@@ -149,7 +157,7 @@ def predict_next_token(model: nnx.Module, input_ids: jax.Array) -> jax.Array:
 
 
 def interactive_chat(
-    model: nnx.Module, tokenizer: PreTrainedTokenizer, max_new_tokens: int = 100
+    model: HybridGDN2LM, tokenizer: PreTrainedTokenizer, max_new_tokens: int = 100
 ):
     """Starts an infinite loop for user interaction."""
 
@@ -157,6 +165,12 @@ def interactive_chat(
     print("🤖 Massive LLM is online and ready!")
     print("Type 'quit' or 'exit' to shut down the server.")
     print("=" * 50 + "\n")
+
+    # Model constraints the generation loop must respect:
+    #   • the GDN-2 kernel requires seq_len % chunk_size == 0
+    #   • RoPE is only precomputed up to max_seq_len positions
+    chunk_size: int = model.cells[0].gdn2.chunk_size
+    max_seq_len: int = int(model.rope_cos[...].shape[0])
 
     # The Infinite Loop
     while True:
@@ -181,8 +195,21 @@ def interactive_chat(
 
         # 4. The Autoregressive Generation Loop
         for _ in range(max_new_tokens):
-            # A. Predict the next token
-            next_token_array = predict_next_token(model, input_ids)
+            # A. Slide the context to the most recent `max_seq_len` tokens so we
+            #    never exceed the precomputed RoPE table.
+            context = input_ids[:, -max_seq_len:]
+            real_len = context.shape[1]
+
+            # B. Right-pad to a multiple of chunk_size for the GDN-2 kernel.
+            #    The last real token sits at index real_len - 1.
+            pad_len = (-real_len) % chunk_size
+            if pad_len:
+                context = np.pad(context, ((0, 0), (0, pad_len)))
+
+            # C. Predict the next token from the last real position
+            next_token_array = predict_next_token(
+                model, jnp.asarray(context), jnp.asarray(real_len - 1)
+            )
 
             # Convert the JAX array back to a standard Python integer
             next_token_id = next_token_array.item()
@@ -229,7 +256,7 @@ def train_and_evaluate(
     # Initialize Model and Optimizer
     rngs: nnx.Rngs = nnx.Rngs(0)
     model: nnx.Module = HybridGDN2LM(
-        vocab_size=256,
+        vocab_size=gpt2tokenizer.vocab_size,  # must match the tokenizer's id range
         dim=128,
         num_heads=4,
         num_cells=2,
@@ -237,15 +264,13 @@ def train_and_evaluate(
         chunk_size=4,
         conv_kernel=4,
         window_size=16,
-        max_seq_len=64,
+        max_seq_len=128,  # must be >= the dataloader's max_length (128)
         rope_theta=10_000.0,
         tie_embeddings=True,
         rngs=rngs,
     )
 
     optimizer = nnx.Optimizer(model, optax.adamw(learning_rate=3e-4), wrt=nnx.Param)
-
-    data_iterator = iter(train_loader)
 
     step = 0  # restore_checkpoint(mngr, model, optimizer, rngs, data_iterator)
 
@@ -254,36 +279,47 @@ def train_and_evaluate(
         print(f"Resuming training from step {step}...")
 
     for epoch in range(num_epochs):
-        for batch in data_iterator:
-            train_loss = train_step(model, optimizer, batch)
+        # Re-create the iterator each epoch: the Grain sampler is configured
+        # with num_epochs=1, so a single iterator is exhausted after one pass.
+        data_iterator = iter(train_loader)
 
-            if step % eval_every_n_steps == 0 and step > 0:
-                total_val_loss = 0.0
-                val_steps = 0
+        total_train_loss = 0.0
+        train_steps = 0
 
-                for val_batch in val_loader:
-                    val_loss = eval_step(model, val_batch)
-                    total_val_loss += val_loss
-                    val_steps += 1
+        for train_batch in data_iterator:
+            train_loss = train_step(model, optimizer, train_batch)
+            total_train_loss += train_loss
+            train_steps += 1
 
-                avg_val_loss = total_val_loss / val_steps
-                perplexity = math.exp(avg_val_loss)
+        avg_train_loss = total_train_loss / train_steps
+        perplexity = math.exp(avg_train_loss)
 
-                print(
-                    f"Val Loss: {avg_val_loss:.4f} | Perplexity: {perplexity:.2f} | Epoch: {epoch + 1}/{num_epochs}"
-                )
+        print(
+            f"Step {step:04d} | Train Loss: {avg_train_loss:.4f} | Perplexity: {perplexity:.2f} | Epoch: {epoch + 1}/{num_epochs}"
+        )
+
+        if step % eval_every_n_steps == 0 and step > 0:
+            total_val_loss = 0.0
+            val_steps = 0
+
+            for val_batch in val_loader:
+                val_loss = eval_step(model, val_batch)
+                total_val_loss += val_loss
+                val_steps += 1
+
+            avg_val_loss = total_val_loss / val_steps
+            perplexity = math.exp(avg_val_loss)
 
             print(
-                f"Step {step:04d} | Train Loss: {train_loss:.4f} | Epoch: {epoch + 1}/{num_epochs}"
+                f"Val Loss: {avg_val_loss:.4f} | Perplexity: {perplexity:.2f} | Epoch: {epoch + 1}/{num_epochs}"
             )
-            step += 1
 
-            # if step % save_every_n_steps == 0:
-            #     save_checkpoint(mngr, step, model, optimizer, rngs, data_iterator)
+        step += 1
 
-        step = 0  # Reset step count after each epoch
+    step = 0  # Reset step count after each epoch
 
     interactive_chat(model, gpt2tokenizer, max_new_tokens=150)
 
 
-train_and_evaluate()
+if __name__ == "__main__":
+    train_and_evaluate()
