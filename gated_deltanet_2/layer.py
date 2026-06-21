@@ -2,8 +2,10 @@ import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 
-from conv.nnx_conv import ShortCausalConv
-from gated_delta_rule.chunked_optimized import chunked_forward_optimized
+from gated_deltanet_2.conv.nnx_conv import ShortCausalConv
+from gated_deltanet_2.gated_delta_rule.chunked_optimized import (
+    chunked_forward_optimized,
+)
 
 # ---------------------------------------------------------------------------
 # Gated DeltaNet-2 token mixer  (GDN-2 block, Fig. 1)

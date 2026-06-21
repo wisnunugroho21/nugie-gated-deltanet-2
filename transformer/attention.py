@@ -1,7 +1,8 @@
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
-from rope import apply_rope
+
+from transformer.rope import apply_rope
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Sliding-Window Attention
